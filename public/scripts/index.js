@@ -1,3 +1,228 @@
+// =================================================================
+//                      DYNAMIC PREVIEW ENGINE
+// =================================================================
+
+// Biến cache để đảm bảo ảnh chỉ được tải và xử lý một lần.
+let previewTemplatePromise = null;
+
+/**
+ * Tải và xử lý file /previews/preview-image.png để chuyển thành dữ liệu template.
+ * Kết quả sẽ được cache lại cho các lần gọi sau.
+ * @returns {Promise<{width: number, height: number, data: number[][]}>}
+ */
+function loadPreviewTemplate() {
+    if (previewTemplatePromise) {
+        return previewTemplatePromise; // Trả về promise đã cache nếu có
+    }
+
+    previewTemplatePromise = new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = "Anonymous";
+        img.src = '/previews/preview-image.png'; // Đường dẫn đến file ảnh của bạn
+
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+
+            const imageData = ctx.getImageData(0, 0, img.width, img.height);
+            const pixelData = imageData.data;
+            
+            // Tạo một map để tra cứu ID màu từ chuỗi RGB cho nhanh
+            const rgbToIdMap = new Map();
+            for (const [rgb, colorData] of Object.entries(colors)) {
+                rgbToIdMap.set(rgb, colorData.id);
+            }
+
+            const matrix = Array.from({ length: img.height }, () => Array(img.width).fill(0));
+
+            for (let y = 0; y < img.height; y++) {
+                for (let x = 0; x < img.width; x++) {
+                    const i = (y * img.width + x) * 4;
+                    const r = pixelData[i];
+                    const g = pixelData[i + 1];
+                    const b = pixelData[i + 2];
+                    const a = pixelData[i + 3];
+
+                    if (a > 128) { // Chỉ xử lý pixel không trong suốt
+                        const rgbKey = `${r},${g},${b}`;
+                        matrix[y][x] = rgbToIdMap.get(rgbKey) || 0;
+                    }
+                }
+            }
+            resolve({ width: img.width, height: img.height, data: matrix });
+        };
+
+        img.onerror = () => {
+            reject(new Error('Không thể tải file /previews/preview-image.png. Hãy chắc chắn file tồn tại trong thư mục public/previews/'));
+            previewTemplatePromise = null; // Reset promise để có thể thử lại
+        };
+    });
+    return previewTemplatePromise;
+}
+
+
+let activeAnimations = new Map();
+let previewsInitialized = false;
+
+/**
+ * Tạo danh sách pixel theo thứ tự vẽ, phụ thuộc vào cả direction và order.
+ */
+function getPixelOrder(template, mode, direction = 'ttb') {
+    let pixels = [];
+    for (let y = 0; y < template.height; y++) {
+        for (let x = 0; x < template.width; x++) {
+            const colorId = template.data[y][x];
+            if (colorId > 0) {
+                pixels.push({ x, y, colorId });
+            }
+        }
+    }
+
+    // Luôn sắp xếp theo direction trước
+    switch (direction) {
+        case 'btt':
+            pixels.sort((a, b) => b.y - a.y || a.x - b.x);
+            break;
+        case 'ltr':
+            pixels.sort((a, b) => a.x - b.x || a.y - b.y);
+            break;
+        case 'rtl':
+            pixels.sort((a, b) => b.x - a.x || a.y - b.y);
+            break;
+        case 'center_out': {
+            const cx = template.width / 2;
+            const cy = template.height / 2;
+            pixels.sort((a, b) => (Math.sqrt((a.x - cx)**2 + (a.y - cy)**2)) - (Math.sqrt((b.x - cx)**2 + (b.y - cy)**2)));
+            break;
+        }
+        default:
+            pixels.sort((a, b) => a.y - b.y || a.x - b.x);
+            break;
+    }
+
+    // Bây giờ áp dụng Order Mode lên danh sách đã được sắp xếp theo Direction
+    switch (mode) {
+        case 'linear':
+            // Không làm gì cả, giữ nguyên thứ tự của direction
+            break;
+        case 'random':
+            for (let i = pixels.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [pixels[i], pixels[j]] = [pixels[j], pixels[i]];
+            }
+            break;
+        case 'color':
+        case 'randomColor': {
+            let grouped = pixels.reduce((acc, p) => {
+                (acc[p.colorId] = acc[p.colorId] || []).push(p);
+                return acc;
+            }, {});
+            let buckets = Object.values(grouped);
+            if (mode === 'randomColor') {
+                for (let i = buckets.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [buckets[i], buckets[j]] = [buckets[j], buckets[i]];
+                }
+            }
+            pixels = buckets.flat();
+            break;
+        }
+    }
+    return pixels;
+}
+
+// Hàm chính để vẽ hoạt ảnh, đã sửa lỗi ghi đè
+function animatePreview(canvas, template, mode, direction = 'ttb') {
+    // Luôn hủy animation cũ ngay lập tức
+    if (activeAnimations.has(canvas)) {
+        cancelAnimationFrame(activeAnimations.get(canvas));
+        activeAnimations.delete(canvas);
+    }
+    
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    const finalDirection = ['ttb', 'btt', 'ltr', 'rtl', 'center_out'].includes(mode) ? mode : direction;
+    const pixelOrder = getPixelOrder(template, mode, finalDirection);
+    const totalPixels = pixelOrder.length;
+    const pixelsPerFrame = Math.max(15, Math.floor(totalPixels / 50));
+    let currentPixelIndex = 0;
+
+    const draw = () => {
+        const batchEnd = Math.min(currentPixelIndex + pixelsPerFrame, totalPixels);
+        for (let i = currentPixelIndex; i < batchEnd; i++) {
+            const p = pixelOrder[i];
+            const rgbKey = colorById(p.colorId);
+            if (rgbKey) {
+                ctx.fillStyle = `rgb(${rgbKey})`;
+                ctx.fillRect(p.x, p.y, 1, 1);
+            }
+        }
+        currentPixelIndex = batchEnd;
+        if (currentPixelIndex >= totalPixels) {
+            setTimeout(() => {
+                currentPixelIndex = 0;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                startLoop();
+            }, 700);
+        } else {
+            startLoop();
+        }
+    };
+
+    const startLoop = () => {
+        const frameId = requestAnimationFrame(draw);
+        activeAnimations.set(canvas, frameId);
+    };
+    
+    startLoop();
+}
+
+async function initializePreviews() {
+    if (previewsInitialized) return;
+    try {
+        const template = await loadPreviewTemplate();
+        const currentDirection = $('drawingDirectionSelect').value;
+        document.querySelectorAll('.preview-item canvas').forEach(canvas => {
+            canvas.width = template.width;
+            canvas.height = template.height;
+        });
+        document.querySelectorAll('.preview-item').forEach(item => {
+            const canvas = item.querySelector('canvas');
+            const mode = item.dataset.value;
+            if (canvas && mode) {
+                animatePreview(canvas, template, mode, currentDirection);
+            }
+        });
+        previewsInitialized = true;
+    } catch (error) {
+        console.error(error);
+        showMessage('Lỗi Preview', error.message);
+    }
+}
+
+async function rerenderLinearPreview() {
+    if (!previewsInitialized) return;
+    try {
+        const template = await loadPreviewTemplate();
+        const linearPreviewItem = document.querySelector('#drawingOrderPreview .preview-item[data-value="linear"]');
+        if (linearPreviewItem) {
+            const canvas = linearPreviewItem.querySelector('canvas');
+            const currentDirection = $('drawingDirectionSelect').value;
+            animatePreview(canvas, template, 'linear', currentDirection);
+        }
+    } catch(error) {
+        console.error("Không thể vẽ lại preview:", error);
+    }
+}
+
+// =================================================================
+//                      END PREVIEW ENGINE
+// =================================================================
+
 // elements
 const $ = (id) => document.getElementById(id);
 const main = $('main');
@@ -34,6 +259,7 @@ const userSelectList = $('userSelectList');
 const selectAllUsers = $('selectAllUsers');
 const canBuyMaxCharges = $('canBuyMaxCharges');
 const canBuyCharges = $('canBuyCharges');
+const autoBuyNeededColors = $('autoBuyNeededColors');
 const antiGriefMode = $('antiGriefMode');
 const eraseMode = $('eraseMode');
 const templateOutlineMode = $('templateOutlineMode');
@@ -71,7 +297,6 @@ const proxyCount = $('proxyCount');
 const reloadProxiesBtn = $('reloadProxiesBtn');
 const logProxyUsage = $('logProxyUsage');
 
-// --- START: DETAILED STEALTH MODE ELEMENTS (RESTORED) ---
 const stealthMode = $("stealthMode");
 const stealthOptions = $("stealthOptions");
 const stealthChargeThresholdFluctuation = $("stealthChargeThresholdFluctuation");
@@ -84,9 +309,7 @@ const stealthBreakMinMinutes = $("stealthBreakMinMinutes");
 const stealthBreakMaxMinutes = $("stealthBreakMaxMinutes");
 const stealthTileDelayMinMs = $("stealthTileDelayMinMs");
 const stealthTileDelayMaxMs = $("stealthTileDelayMaxMs");
-// --- END: DETAILED STEALTH MODE ELEMENTS (RESTORED) ---
 
-// Logs Viewer
 const openLogsViewer = $('openLogsViewer');
 const logsViewer = $('logsViewer');
 const logsContainer = $('logsContainer');
@@ -97,15 +320,13 @@ const logsSearchInput = $('logsSearchInput');
 const logsExportBtn = $('logsExportBtn');
 const logsTypeFilter = $('logsTypeFilter');
 
-// --- Global State ---
 let templateUpdateInterval = null;
 let confirmCallback = null;
 let currentTab = 'main';
 let currentTemplate = { width: 0, height: 0, data: [] };
 
-
 let logsWs = null;
-let logsMode = 'logs'; // 'logs' or 'errors'
+let logsMode = 'logs';
 let allLogLines = [];
 let filterText = '';
 let filterType = '';
@@ -220,7 +441,6 @@ function connectLogsWs() {
     };
     logsWs.onmessage = (event) => {
         if (logsContainer.querySelector('.logs-placeholder')) logsContainer.innerHTML = '';
-        // If first message is JSON, treat as initial log dump
         try {
             const data = JSON.parse(event.data);
             if (Array.isArray(data.initial)) {
@@ -282,7 +502,6 @@ if (logsTypeFilter) {
 if (logsExportBtn) {
     logsExportBtn.addEventListener('click', () => {
         const filtered = getFilteredLogs();
-        // Redact user discriminator: (Name#12345678) => (Name#REDACTED)
         const redacted = filtered.map(line => line.replace(/\(([^#()]+)#\d{5,}\)/g, '($1#REDACTED)'));
         const blob = new Blob([redacted.join('\n')], { type: 'text/plain' });
         const url = URL.createObjectURL(blob);
@@ -338,59 +557,12 @@ clearLogsBtn.addEventListener('click', () => {
     logsContainer.innerHTML = '';
 });
 
-// --- Logs search/filter/export ---
 if (typeof logsSearchInput !== 'undefined' && logsSearchInput) {
     logsSearchInput.addEventListener('input', (e) => {
         filterText = e.target.value;
         renderFilteredLogs();
     });
 }
-
-
-// users
-const loadUsers = async (f) => {
-    try {
-        const users = await axios.get('/users');
-        if (f) f(users.data);
-    } catch (error) {
-        handleError(error);
-    }
-};
-
-userForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    let jValue = jcookie.value.trim();
-
-    if (!jValue) {
-        try {
-            const text = await navigator.clipboard.readText();
-            if (text) {
-                jcookie.value = text;
-                jValue = text.trim();
-            }
-        } catch (err) {
-            console.error('Failed to read clipboard contents: ', err);
-            showMessage('Clipboard Error', 'Could not read from clipboard. Please paste the cookie manually.');
-            return;
-        }
-    }
-
-    if (!jValue) {
-        showMessage('Error', 'JWT Cookie (j) is required.');
-        return;
-    }
-
-    try {
-        const response = await axios.post('/user', { cookies: { s: scookie.value, j: jValue } });
-        if (response.status === 200) {
-            showMessage('Success', `Logged in as ${response.data.name} (#${response.data.id})!`);
-            userForm.reset();
-            openManageUsers.click(); // Refresh the view
-        }
-    } catch (error) {
-        handleError(error);
-    }
-});
 
 const colors = {
     '0,0,0': { id: 1, name: 'Black' },
@@ -470,6 +642,50 @@ const closest = (color) => {
     });
 };
 
+const loadUsers = async (f) => {
+    try {
+        const users = await axios.get('/users');
+        if (f) f(users.data);
+    } catch (error) {
+        handleError(error);
+    }
+};
+
+userForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    let jValue = jcookie.value.trim();
+
+    if (!jValue) {
+        try {
+            const text = await navigator.clipboard.readText();
+            if (text) {
+                jcookie.value = text;
+                jValue = text.trim();
+            }
+        } catch (err) {
+            console.error('Failed to read clipboard contents: ', err);
+            showMessage('Clipboard Error', 'Could not read from clipboard. Please paste the cookie manually.');
+            return;
+        }
+    }
+
+    if (!jValue) {
+        showMessage('Error', 'JWT Cookie (j) is required.');
+        return;
+    }
+
+    try {
+        const response = await axios.post('/user', { cookies: { s: scookie.value, j: jValue } });
+        if (response.status === 200) {
+            showMessage('Success', `Logged in as ${response.data.name} (#${response.data.id})!`);
+            userForm.reset();
+            openManageUsers.click();
+        }
+    } catch (error) {
+        handleError(error);
+    }
+});
+
 const drawTemplate = (template, canvas) => {
     canvas.width = template.width;
     canvas.height = template.height;
@@ -486,7 +702,6 @@ const drawTemplate = (template, canvas) => {
             const i = (y * template.width + x) * 4;
 
             if (color === -1) {
-                // keep your sentinel behavior
                 imageData.data[i] = 158;
                 imageData.data[i + 1] = 189;
                 imageData.data[i + 2] = 255;
@@ -496,8 +711,6 @@ const drawTemplate = (template, canvas) => {
 
             const key = Object.keys(colors).find((k) => colors[k].id === color);
             if (!key) {
-                // Unknown color id. Skip to avoid `.split` crash.
-                // Optional: console.warn('Unknown color id:', color);
                 continue;
             }
 
@@ -521,13 +734,11 @@ const loadTemplates = async (f) => {
     }
 };
 
-// --- START: REFACTORED fetchCanvas ---
 const fetchCanvas = async (coords, templateCanvas, targetCanvas) => {
     const [txVal, tyVal, pxVal, pyVal] = coords;
     const { width, height } = templateCanvas;
 
     const TILE_SIZE = 1000;
-    // Lấy giá trị border từ input chung, nếu không có thì mặc định là 0
     const radiusInput = document.getElementById('previewBorder');
     const radius = Math.max(0, parseInt(radiusInput.value, 10) || 0);
 
@@ -565,9 +776,7 @@ const fetchCanvas = async (coords, templateCanvas, targetCanvas) => {
                 const dy = tyi * TILE_SIZE + sy - startY;
                 ctx.drawImage(img, sx, sy, sw, sh, dx, dy, sw, sh);
             } catch (error) {
-                // Đừng hiển thị lỗi pop-up cho mỗi tile, chỉ log ra console
                 console.error(`Failed to fetch tile ${txi}, ${tyi}:`, error);
-                // Vẽ một ô màu đỏ để báo lỗi
                 ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
                 const dx = txi * TILE_SIZE - startX;
                 const dy = tyi * TILE_SIZE - startY;
@@ -576,16 +785,12 @@ const fetchCanvas = async (coords, templateCanvas, targetCanvas) => {
         }
     }
 
-    // Chồng template lên
-    ctx.globalAlpha = 0.2; // Tăng độ mờ một chút để dễ nhìn
+    ctx.globalAlpha = 0.2;
     ctx.drawImage(templateCanvas, radius, radius);
     ctx.globalAlpha = 1;
 
-    // Hiển thị canvas mục tiêu
     targetCanvas.parentElement.style.display = 'block';
 };
-// --- END: REFACTORED fetchCanvas ---
-
 
 const nearestimgdecoder = (imageData, width, height) => {
     const d = imageData.data;
@@ -610,7 +815,7 @@ const nearestimgdecoder = (imageData, width, height) => {
                         matrix[x][y] = colorObj.id;
                         uniqueColors.add(colorObj.id);
                     } else {
-                        matrix[x][y] = 0; // fallback if not found
+                        matrix[x][y] = 0;
                     }
                 }
                 ink++;
@@ -668,18 +873,11 @@ const processEvent = () => {
             previewCanvas.style.display = 'none';
             details.style.display = 'block';
 
-            // Update the color grid to show only colors in this image
             if (template.uniqueColors && template.uniqueColors.length > 0) {
-                // Clear current available colors and set to image colors
                 availableColors.clear();
                 template.uniqueColors.forEach(colorId => availableColors.add(colorId));
-                
-                // Update the color grid with image-specific colors
                 updateColorGridForImage(template.uniqueColors);
-                
             } else {
-                // Fallback to all colors if no unique colors found
-                console.warn('No unique colors found in image, showing all colors');
                 availableColors = new Set(Object.values(colors).map(c => c.id));
                 resetOrder();
             }
@@ -689,7 +887,6 @@ const processEvent = () => {
 
 convertInput.addEventListener('change', processEvent);
 
-// --- START: UPDATED OLD PREVIEW BUTTON LOGIC ---
 previewCanvasButton.addEventListener('click', async () => {
     const txVal = parseInt(tx.value, 10);
     const tyVal = parseInt(ty.value, 10);
@@ -700,7 +897,6 @@ previewCanvasButton.addEventListener('click', async () => {
         return;
     }
     
-    // Giờ chúng ta gọi hàm đã refactor với các canvas tương ứng
     const coords = [txVal, tyVal, pxVal, pyVal];
     try {
         previewCanvasButton.disabled = true;
@@ -713,7 +909,6 @@ previewCanvasButton.addEventListener('click', async () => {
         previewCanvasButton.innerHTML = "Preview Canvas";
     }
 });
-// --- END: UPDATED OLD PREVIEW BUTTON LOGIC ---
 
 function pastePinCoordinates(text) {
     const patterns = [
@@ -740,17 +935,34 @@ document.addEventListener('paste', (e) => {
     }
 });
 
+autoBuyNeededColors.addEventListener('change', () => {
+    if (autoBuyNeededColors.checked) {
+        canBuyCharges.checked = false;
+        canBuyMaxCharges.checked = false;
+        canBuyCharges.disabled = true;
+        canBuyMaxCharges.disabled = true;
+    } else {
+        canBuyCharges.disabled = false;
+        canBuyMaxCharges.disabled = false;
+    }
+});
+
 canBuyMaxCharges.addEventListener('change', () => {
     if (canBuyMaxCharges.checked) {
         canBuyCharges.checked = false;
+        autoBuyNeededColors.checked = false;
+        autoBuyNeededColors.dispatchEvent(new Event('change'));
     }
 });
 
 canBuyCharges.addEventListener('change', () => {
     if (canBuyCharges.checked) {
         canBuyMaxCharges.checked = false;
+        autoBuyNeededColors.checked = false;
+        autoBuyNeededColors.dispatchEvent(new Event('change'));
     }
 });
+
 
 const resetTemplateForm = () => {
     templateForm.reset();
@@ -760,7 +972,8 @@ const resetTemplateForm = () => {
     details.style.display = 'none';
     previewCanvas.style.display = 'none';
     currentTemplate = { width: 0, height: 0, data: [] };
-
+    canBuyCharges.disabled = false;
+    canBuyMaxCharges.disabled = false;
     currentTemplateId = null;
     availableColors.clear();
     initializeGrid(null);
@@ -786,6 +999,7 @@ templateForm.addEventListener('submit', async (e) => {
         userIds: selectedUsers,
         canBuyCharges: canBuyCharges.checked,
         canBuyMaxCharges: canBuyMaxCharges.checked,
+        autoBuyNeededColors: autoBuyNeededColors.checked,
         antiGriefMode: antiGriefMode.checked,
         eraseMode: eraseMode.checked,
         outlineMode: templateOutlineMode.checked,
@@ -802,13 +1016,11 @@ templateForm.addEventListener('submit', async (e) => {
         if (isEditMode) {
             templateId = templateForm.dataset.editId;
             await axios.put(`/template/edit/${templateId}`, data);
-            // Save the color ordering for this template
             colorOrderSaved = await saveColorOrder(templateId);
             showMessage('Success', 'Template updated!');
         } else {
             const response = await axios.post('/template', data);
             templateId = response.data.id;
-            // Save the color ordering for this template
             colorOrderSaved = await saveColorOrder(templateId);
             showMessage('Success', 'Template created!');
         }
@@ -1043,11 +1255,9 @@ const createToggleButton = (template, id, buttonsContainer, progressBarText, cur
             await axios.put(`/template/${id}`, { running: shouldBeRunning });
             template.running = shouldBeRunning;
 
-            // Update button appearance
             button.className = template.running ? 'destructive-button' : 'primary-button';
             button.innerHTML = `<img src="icons/${template.running ? 'pause' : 'play'}.svg">${template.running ? 'Stop' : 'Start'}`;
 
-            // Update progress bar
             const newStatus = template.running ? 'Started' : 'Stopped';
             progressBarText.textContent = `${currentPercent}% | ${newStatus}`;
             const progressBar = progressBarText.previousElementSibling;
@@ -1095,7 +1305,6 @@ const updateTemplateStatus = async () => {
     }
 };
 
-// --- START: UPDATED createTemplateCard (v2) ---
 const createTemplateCard = (t, id) => {
     const total = t.totalPixels || 1;
     const remaining = t.pixelsRemaining != null ? t.pixelsRemaining : total;
@@ -1135,7 +1344,6 @@ const createTemplateCard = (t, id) => {
 
     const previewBtn = document.createElement('button');
     previewBtn.className = 'secondary-button';
-    // THAY ĐỔI 1: Sửa văn bản ban đầu
     previewBtn.innerHTML = '<img src="icons/preview.svg" alt="Preview Icon">Enable Preview'; 
     actions.appendChild(previewBtn);
 
@@ -1173,17 +1381,16 @@ const createTemplateCard = (t, id) => {
         const isVisible = previewContainer.style.display === 'block';
         if (isVisible) {
             previewContainer.style.display = 'none';
-            // THAY ĐỔI 2: Sửa văn bản khi đóng
             previewBtn.innerHTML = '<img src="icons/preview.svg" alt="Preview Icon">Enable Preview'; 
         } else {
             try {
                 previewBtn.disabled = true;
                 previewBtn.innerHTML = 'Loading Preview...';
                 await fetchCanvas(t.coords, staticCanvas, realtimeCanvas);
+                previewContainer.style.display = 'block';
                 previewBtn.innerHTML = '<img src="icons/close.svg" alt="Close Icon">Close Preview';
             } catch (error) {
                 handleError(error);
-                // THAY ĐỔI 3: Sửa văn bản khi có lỗi
                 previewBtn.innerHTML = '<img src="icons/preview.svg" alt="Preview Icon">Enable Preview';
                 previewContainer.style.display = 'none';
             } finally {
@@ -1193,11 +1400,11 @@ const createTemplateCard = (t, id) => {
     });
 
     shareBtn.addEventListener('click', async () => {
-        if (!t.shareCode) {
+        if (!t.template.shareCode) {
             showMessage('Error', 'No share code available for this template.');
             return;
         }
-        await navigator.clipboard.writeText(t.shareCode);
+        await navigator.clipboard.writeText(t.template.shareCode);
         showMessage('Copied!', 'Share code copied to clipboard.');
     });
 
@@ -1210,6 +1417,8 @@ const createTemplateCard = (t, id) => {
         [tx.value, ty.value, px.value, py.value] = t.coords;
         canBuyCharges.checked = t.canBuyCharges;
         canBuyMaxCharges.checked = t.canBuyMaxCharges;
+        autoBuyNeededColors.checked = t.autoBuyNeededColors;
+        autoBuyNeededColors.dispatchEvent(new Event('change'));
         antiGriefMode.checked = t.antiGriefMode;
         eraseMode.checked = t.eraseMode;
         templateOutlineMode.checked = t.outlineMode;
@@ -1236,7 +1445,7 @@ const createTemplateCard = (t, id) => {
 
     return card;
 };
-// --- END: UPDATED createTemplateCard (v2) ---
+
 let importShareCode = false;
 openManageTemplates.addEventListener('click', () => {
     templateList.innerHTML = '';
@@ -1308,7 +1517,6 @@ openSettings.addEventListener('click', async () => {
         antiGriefStandby.value = s.antiGriefStandby / 60000;
         chargeThreshold.value = s.chargeThreshold * 100;
         
-        // --- START: DETAILED STEALTH MODE SETTINGS (RESTORED) ---
         stealthMode.checked = s.stealthMode;
         stealthOptions.style.display = s.stealthMode ? 'block' : 'none';
         
@@ -1322,12 +1530,13 @@ openSettings.addEventListener('click', async () => {
         stealthBreakMaxMinutes.value = s.stealthBreakMaxMinutes;
         stealthTileDelayMinMs.value = s.stealthTileDelayMinMs;
         stealthTileDelayMaxMs.value = s.stealthTileDelayMaxMs;
-        // --- END: DETAILED STEALTH MODE SETTINGS (RESTORED) ---
 
     } catch (error) {
         handleError(error);
     }
     changeTab('settings');
+    
+    initializePreviews();
 });
 
 const saveSetting = async (setting) => {
@@ -1371,7 +1580,6 @@ reloadProxiesBtn.addEventListener('click', async () => {
     }
 });
 
-// --- START: DETAILED STEALTH MODE EVENT LISTENERS (RESTORED) ---
 const setupSettingListener = (element, key, isInt = true) => {
     element.addEventListener('change', () => {
         let value = element.value;
@@ -1399,60 +1607,41 @@ setupSettingListener(stealthBreakMinMinutes, 'stealthBreakMinMinutes');
 setupSettingListener(stealthBreakMaxMinutes, 'stealthBreakMaxMinutes');
 setupSettingListener(stealthTileDelayMinMs, 'stealthTileDelayMinMs');
 setupSettingListener(stealthTileDelayMaxMs, 'stealthTileDelayMaxMs');
-// --- END: DETAILED STEALTH MODE EVENT LISTENERS (RESTORED) ---
 
 
 accountCooldown.addEventListener('change', () => {
     const value = parseInt(accountCooldown.value, 10) * 1000;
-    if (isNaN(value) || value < 0) {
-        showMessage('Error', 'Please enter a valid non-negative number.');
-        return;
-    }
+    if (isNaN(value) || value < 0) return;
     saveSetting({ accountCooldown: value });
 });
 
 purchaseCooldown.addEventListener('change', () => {
     const value = parseInt(purchaseCooldown.value, 10) * 1000;
-    if (isNaN(value) || value < 0) {
-        showMessage('Error', 'Please enter a valid non-negative number.');
-        return;
-    }
+    if (isNaN(value) || value < 0) return;
     saveSetting({ purchaseCooldown: value });
 });
 
 accountCheckCooldown.addEventListener('change', () => {
     const value = parseInt(accountCheckCooldown.value, 10) * 1000;
-    if (isNaN(value) || value < 0) {
-        showMessage('Error', 'Please enter a valid non-negative number.');
-        return;
-    }
+    if (isNaN(value) || value < 0) return;
     saveSetting({ accountCheckCooldown: value });
 });
 
 dropletReserve.addEventListener('change', () => {
     const value = parseInt(dropletReserve.value, 10);
-    if (isNaN(value) || value < 0) {
-        showMessage('Error', 'Please enter a valid non-negative number.');
-        return;
-    }
+    if (isNaN(value) || value < 0) return;
     saveSetting({ dropletReserve: value });
 });
 
 antiGriefStandby.addEventListener('change', () => {
     const value = parseInt(antiGriefStandby.value, 10) * 60000;
-    if (isNaN(value) || value < 60000) {
-        showMessage('Error', 'Please enter a valid number (at least 1 minute).');
-        return;
-    }
+    if (isNaN(value) || value < 60000) return;
     saveSetting({ antiGriefStandby: value });
 });
 
 chargeThreshold.addEventListener('change', () => {
     const value = parseInt(chargeThreshold.value, 10);
-    if (isNaN(value) || value < 0 || value > 100) {
-        showMessage('Error', 'Please enter a valid percentage between 0 and 100.');
-        return;
-    }
+    if (isNaN(value) || value < 0 || value > 100) return;
     saveSetting({ chargeThreshold: value / 100 });
 });
 
@@ -1485,12 +1674,10 @@ tx.addEventListener('blur', () => {
     });
 });
 
-// --- Color Ordering
 const colorGrid = document.getElementById('colorGrid');
 let currentTemplateId = null;
 let availableColors = new Set();
 
-// Single function handles all initialization
 async function initializeGrid(templateId = null) {
     currentTemplateId = templateId;
     let colorEntries = Object.entries(colors);
@@ -1510,7 +1697,6 @@ async function initializeGrid(templateId = null) {
     await buildGrid(colorEntries, templateId);
 }
 
-// Build grid with saved order applied
 async function buildGrid(colorEntries, templateId = null) {
     try {
         const { order = [] } = await (await fetch(templateId ? `/color-ordering?templateId=${templateId}` : `/color-ordering`)).json();
@@ -1519,7 +1705,6 @@ async function buildGrid(colorEntries, templateId = null) {
         colorGrid.innerHTML = '';
         let priority = 1;
         
-        // Add ordered colors first
         order.forEach(id => {
             const colorInfo = colorMap.get(id);
             if (colorInfo) {
@@ -1528,7 +1713,6 @@ async function buildGrid(colorEntries, templateId = null) {
             }
         });
         
-        // Add remaining colors
         [...colorMap.values()].sort((a, b) => a.id - b.id).forEach(colorInfo => {
             colorGrid.appendChild(createColorItem(colorInfo.rgb, colorInfo, priority++));
         });
@@ -1539,7 +1723,6 @@ async function buildGrid(colorEntries, templateId = null) {
     }
 }
 
-// Create color item element
 const createColorItem = (rgb, { id, name }, priority) => {
     const div = document.createElement('div');
     div.className = 'color-item';
@@ -1550,7 +1733,6 @@ const createColorItem = (rgb, { id, name }, priority) => {
     return div;
 };
 
-// Drag and drop with single event listener
 let draggedElement = null;
 colorGrid.addEventListener('mousedown', e => e.target.closest('.color-item')?.setAttribute('draggable', 'true'));
 
@@ -1572,7 +1754,6 @@ colorGrid.addEventListener('drop', e => {
         const [dragIdx, dropIdx] = [items.indexOf(draggedElement), items.indexOf(dropTarget)];
         colorGrid.insertBefore(draggedElement, dropIdx < dragIdx ? dropTarget : dropTarget.nextSibling);
         
-        // Update priorities and save
         [...colorGrid.children].forEach((item, i) => item.querySelector('.priority-number').textContent = i + 1);
         if (currentTemplateId) saveColorOrder(currentTemplateId);
     }
@@ -1583,7 +1764,6 @@ colorGrid.addEventListener('dragend', () => {
     draggedElement = null;
 });
 
-// Save color order
 const saveColorOrder = async (templateId = null) => {
     const order = [...colorGrid.children].map(el => parseInt(el.dataset.id));
     const url = templateId ? `/color-ordering/template/${templateId}` : `/color-ordering/global`;
@@ -1592,10 +1772,62 @@ const saveColorOrder = async (templateId = null) => {
     } catch { return false; }
 };
 
-// Quick reset and image color functions
 const resetOrder = () => buildGrid(Object.entries(colors).filter(([_, data]) => !currentTemplateId || availableColors.has(data.id)));
 const updateColorGridForImage = (imageColorIds) => {
     availableColors = new Set(imageColorIds);
     const imageColors = imageColorIds.map(id => [Object.keys(colors).find(rgb => colors[rgb].id === id), colors[Object.keys(colors).find(rgb => colors[rgb].id === id)]]).filter(([rgb]) => rgb);
     buildGrid(imageColors);
 };
+
+// --- START: Drawing Preview and UI Logic ---
+
+// Hàm xử lý việc vô hiệu hóa/kích hoạt phần Drawing Direction
+function handleDirectionState() {
+    const order = drawingOrderSelect.value;
+    const directionContainer = $('drawingDirectionContainer');
+    directionContainer.classList.toggle('disabled', order !== 'linear');
+}
+
+const setupPreviewGridInteraction = (gridId, selectId) => {
+    const grid = $(gridId);
+    if (!grid) return;
+    const select = $(selectId);
+    const items = grid.querySelectorAll('.preview-item');
+
+    const updateActive = (selectedValue) => {
+        items.forEach(item => {
+            item.classList.toggle('active', item.dataset.value === selectedValue);
+        });
+    };
+
+    items.forEach(item => {
+        item.addEventListener('click', () => {
+            const value = item.dataset.value;
+            select.value = value;
+            select.dispatchEvent(new Event('change'));
+            updateActive(value);
+        });
+    });
+
+    select.addEventListener('change', () => {
+        updateActive(select.value);
+        // Khi direction thay đổi, gọi hàm vẽ lại preview 'Linear'
+        if (gridId === 'drawingDirectionPreview') {
+            rerenderLinearPreview();
+        }
+    });
+
+    updateActive(select.value);
+};
+
+// Listener chính khi trang được tải xong
+document.addEventListener('DOMContentLoaded', () => {
+    setupPreviewGridInteraction('drawingDirectionPreview', 'drawingDirectionSelect');
+    setupPreviewGridInteraction('drawingOrderPreview', 'drawingOrderSelect');
+    
+    // Thêm listener cho Drawing Order để điều khiển Drawing Direction
+    drawingOrderSelect.addEventListener('change', handleDirectionState);
+    
+    // Đặt trạng thái ban đầu khi tải trang
+    handleDirectionState();
+});
