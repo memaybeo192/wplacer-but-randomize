@@ -719,13 +719,16 @@ class WPlacer {
         return total;
     }
 
-    async buyProduct(productId, amount) {
-        const res = await this.post(WPLACE_PURCHASE, { product: { id: productId, amount } });
+    async buyProduct(productId, amount, variant) {
+        const body = { product: { id: productId, amount } };
+        if (typeof variant === "number") body.product.variant = variant;
+        const res = await this.post(WPLACE_PURCHASE, body);
 
         if (res.data.success) {
             let msg = `Purchase ok product #${productId} amount ${amount}`;
             if (productId === 80) msg = `Bought ${amount * 30} pixels for ${amount * 500} droplets`;
             else if (productId === 70) msg = `Bought ${amount} Max Charge for ${amount * 500} droplets`;
+            else if (productId === 100 && typeof variant === 'number') msg = `Bought premium color #${variant}`;
             log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] 💰 ${msg}`);
             return true;
         }
@@ -899,6 +902,7 @@ function saveTemplatesCompressed() {
                 coords: t.coords,
                 canBuyCharges: t.canBuyCharges,
                 canBuyMaxCharges: t.canBuyMaxCharges,
+                autoBuyNeededColors: t.autoBuyNeededColors,
                 antiGriefMode: t.antiGriefMode,
                 eraseMode: t.eraseMode,
                 outlineMode: t.outlineMode,
@@ -1037,13 +1041,14 @@ function logUserError(error, id, name, context) {
 // -------------------------------------------------------------------------------------------------
 
 class TemplateManager {
-    constructor({ templateId, name, templateData, coords, canBuyCharges, canBuyMaxCharges, antiGriefMode, eraseMode, outlineMode, skipPaintedPixels, enableAutostart, userIds }) {
+    constructor({ templateId, name, templateData, coords, canBuyCharges, canBuyMaxCharges, autoBuyNeededColors, antiGriefMode, eraseMode, outlineMode, skipPaintedPixels, enableAutostart, userIds }) {
         this.templateId = templateId;
         this.name = name;
         this.template = templateData;
         this.coords = coords;
         this.canBuyCharges = canBuyCharges;
         this.canBuyMaxCharges = canBuyMaxCharges;
+        this.autoBuyNeededColors = autoBuyNeededColors;
         this.antiGriefMode = antiGriefMode;
         this.eraseMode = eraseMode;
         this.outlineMode = outlineMode;
@@ -1678,7 +1683,7 @@ app.get('/templates', (req, res) => {
             }
             templateList[id] = {
                 id, name: manager.name, coords: manager.coords,
-                canBuyCharges: manager.canBuyCharges, canBuyMaxCharges: manager.canBuyMaxCharges,
+                canBuyCharges: manager.canBuyCharges, canBuyMaxCharges: manager.canBuyMaxCharges, autoBuyNeededColors: manager.autoBuyNeededColors,
                 antiGriefMode: manager.antiGriefMode, eraseMode: manager.eraseMode, outlineMode: manager.outlineMode,
                 skipPaintedPixels: manager.skipPaintedPixels, enableAutostart: manager.enableAutostart,
                 userIds: manager.userIds, running: manager.running, status: manager.status,
@@ -1698,7 +1703,7 @@ app.post('/templates/import', (req, res) => {
     const tmpl = templateFromShareCode(code);
     templates[id] = {
         templateId: id, name: name || `Template ${id}`, coords: coords || [0, 0, 0, 0],
-        canBuyCharges: false, canBuyMaxCharges: false, antiGriefMode: false, eraseMode: false,
+        canBuyCharges: false, canBuyMaxCharges: false, autoBuyNeededColors: false, antiGriefMode: false, eraseMode: false,
         outlineMode: false, skipPaintedPixels: false, enableAutostart: false, userIds: [],
         template: { ...tmpl, shareCode: code }, running: false, status: 'idle',
         pixelsRemaining: tmpl.width * tmpl.height, totalPixels: tmpl.width * tmpl.height,
@@ -1707,14 +1712,14 @@ app.post('/templates/import', (req, res) => {
     res.json({ ok: true });
 });
 app.post('/template', (req, res) => {
-    const { templateName, template, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, eraseMode, outlineMode, skipPaintedPixels, enableAutostart, } = req.body || {};
+    const { templateName, template, coords, userIds, canBuyCharges, canBuyMaxCharges, autoBuyNeededColors, antiGriefMode, eraseMode, outlineMode, skipPaintedPixels, enableAutostart, } = req.body || {};
     if (!templateName || !template || !coords || !userIds || !userIds.length) return res.sendStatus(HTTP_STATUS.BAD_REQ);
     if (Object.values(templates).some((t) => t.name === templateName)) return res.status(HTTP_STATUS.CONFLICT).json({ error: 'A template with this name already exists.' });
 
     const templateId = Date.now().toString();
     templates[templateId] = new TemplateManager({
         templateId, name: templateName, templateData: template, coords,
-        canBuyCharges, canBuyMaxCharges, antiGriefMode, eraseMode,
+        canBuyCharges, canBuyMaxCharges, autoBuyNeededColors, antiGriefMode, eraseMode,
         outlineMode, skipPaintedPixels, enableAutostart, userIds,
     });
     saveTemplates();
@@ -1732,7 +1737,7 @@ app.put('/template/edit/:id', (req, res) => {
     if (!templates[id]) return res.sendStatus(HTTP_STATUS.BAD_REQ);
 
     const manager = templates[id];
-    const { templateName, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, eraseMode, outlineMode, skipPaintedPixels, enableAutostart, template } = req.body || {};
+    const { templateName, coords, userIds, canBuyCharges, canBuyMaxCharges, autoBuyNeededColors, antiGriefMode, eraseMode, outlineMode, skipPaintedPixels, enableAutostart, template } = req.body || {};
 
     manager.name = templateName;
     manager.coords = coords;
@@ -1740,6 +1745,7 @@ app.put('/template/edit/:id', (req, res) => {
     manager.userQueue = [...userIds];
     manager.canBuyCharges = canBuyCharges;
     manager.canBuyMaxCharges = canBuyMaxCharges;
+    manager.autoBuyNeededColors = autoBuyNeededColors;
     manager.antiGriefMode = antiGriefMode;
     manager.eraseMode = eraseMode;
     manager.outlineMode = outlineMode;
@@ -1974,7 +1980,7 @@ const diffVer = (v1, v2) => {
                  █████
                 ▒▒▒▒▒                                          v${version}`));
     try {
-        const githubPackage = await fetch("https://raw.githubusercontent.com/wplacer/wplacer/refs/heads/main/package.json");
+        const githubPackage = await fetch("https://raw.githubusercontent.com/memaybeo192/wplacer-but-randomize/refs/heads/main/package.json");
         const githubVersion = (await githubPackage.json()).version;
         const diff = diffVer(version, githubVersion);
         if (diff !== 0) console.warn(`${diff < 0 ? "⚠️ Outdated version! Please update using \"git pull\"." : "🤖 Unreleased."}\n  GitHub: ${githubVersion}\n  Local: ${version} (${diff})`);
@@ -2008,7 +2014,7 @@ const diffVer = (v1, v2) => {
             if (t.userIds.every((uid) => users[uid])) {
                 templates[id] = new TemplateManager({
                     templateId: id, name: t.name, templateData, coords: t.coords,
-                    canBuyCharges: t.canBuyCharges, canBuyMaxCharges: t.canBuyMaxCharges,
+                    canBuyCharges: t.canBuyCharges, canBuyMaxCharges: t.canBuyMaxCharges, autoBuyNeededColors: t.autoBuyNeededColors,
                     antiGriefMode: t.antiGriefMode, eraseMode: t.eraseMode, outlineMode: t.outlineMode,
                     skipPaintedPixels: t.skipPaintedPixels, enableAutostart: t.enableAutostart, userIds: t.userIds,
                 });
